@@ -1,0 +1,93 @@
+---
+title: "Risk_Management"
+output: html_document
+date: "2022-11-08"
+---
+
+```{r}
+library(quantmod)
+library(tidyquant)
+library(tidyverse)
+library(readr)
+library(pastecs)
+library(PerformanceAnalytics)
+library(lubridate)
+library(taskscheduleR)
+library(RPostgreSQL)
+library(reshape2)
+library(TTR)
+library(readxl)
+```
+
+```{r}
+stock_df <- read_csv("Allstocks.csv")
+```
+
+```{r}
+con <- DBI::dbConnect(RPostgres::Postgres()
+                      , host='localhost'
+                      , port='5432'
+                      , dbname= 'postgres'
+                      , user='postgres'
+                      , password="Chui1234!")
+```
+
+```{r}
+from_date <- "2023-01-01"
+risk_free_rate <- 0.0383
+var_prob_95 <- 0.95
+var_prob_99 <- 0.99
+getSymbols("^HSI", from = from_date, to = Sys.Date())
+dailyreturn_HSI <-  na.omit(Return.calculate(Cl(HSI)))
+sortino_ratio_HSI <- SortinoRatio(dailyreturn_HSI, MAR = risk_free_rate)
+value_at_risk_95_HSI <- VaR(dailyreturn_HSI, p = var_prob_95, method = "modified")
+value_at_risk_99_HSI <- VaR(dailyreturn_HSI, p = var_prob_99, method = "modified")
+Rb <- na.omit(Return.calculate(Cl(HSI)))
+```
+
+```{r}
+dailyreturn <- xts()
+risk <- data.frame(matrix(ncol = 10, nrow = 0))
+colnames(risk) <- c("symbol", "information_ratio", "sharpe_ratio", "sortino_ratio", "value_at_risk_95", "value_at_risk_99" , "obs_dd", "obs_rc", "ds_freq", "omega")
+```
+
+
+```{r}
+n <- length(stock_df$symbol)
+pb <- txtProgressBar(min = 0, max = n, style=3)
+for(i in 1:length(stock_df$symbol)) {
+  tryit <- try(
+    {stock <- getSymbols(stock_df$symbol[[i]],  from = from_date , to = Sys.Date(), auto.assign = FALSE)
+    dailyreturn <- merge(dailyreturn, na.omit(Return.calculate(stock[,4])))
+    }
+               )
+  if(inherits(tryit, "try-error")){
+    i <- i+1
+  } 
+
+  setTxtProgressBar(pb, i)
+}
+```
+
+```{r}
+for(j in 1:length(stock_df$symbol)) {
+  tryit <- try(
+    {
+        new_risk <- data.frame(stock_df$symbol[j], InformationRatio(dailyreturn[,j], Rb), AdjustedSharpeRatio(dailyreturn[,j], Rf = risk_free_rate), SortinoRatio(dailyreturn[,j], MAR = risk_free_rate), VaR(dailyreturn[,j], p = var_prob_95, method = "modified"), VaR(dailyreturn[,j], p = var_prob_99, method = "modified"), AverageLength(dailyreturn[,j]), AverageRecovery(dailyreturn[,j]), DownsideFrequency(dailyreturn[,j]), Omega(dailyreturn[,j]))
+  colnames(new_risk) <- c("symbol", "information_ratio", "sharpe_ratio", "sortino_ratio", "value_at_risk_95", "value_at_risk_99" , "obs_dd", "obs_rc", "ds_freq", "omega")      
+  risk <- rbind(risk, new_risk)
+  
+    }
+               )
+  if(inherits(tryit, "try-error")){
+    j <- j+1
+  } 
+  setTxtProgressBar(pb, j)
+}
+```
+
+```{r}
+risk[,2:10] <- round(risk[,2:10], digits = 2)
+dbRemoveTable(con, "risk_metric")
+dbWriteTable(con, "risk_metric", risk , append = FALSE)
+```

@@ -1,0 +1,225 @@
+---
+title: "VAR_XGB"
+output:
+  pdf_document: default
+  html_document: default
+  word_document: default
+date: '2022-05-27'
+---
+
+```{r}
+library(quantmod)
+library(tidyquant)
+library(tidyverse)
+library(readr)
+library(pastecs)
+library(PerformanceAnalytics)
+library(lubridate)
+library(taskscheduleR)
+library(RPostgreSQL)
+library(reshape2)
+library(TTR)
+```
+
+
+```{r}
+con <- DBI::dbConnect(RPostgres::Postgres()
+                      , host='localhost'
+                      , port='5432'
+                      , dbname= 'postgres'
+                      , user='postgres'
+                      , password="Chui1234!")
+```
+
+```{r}
+from_date <- "2022-07-01"
+```
+
+
+# industry
+```{r}#
+library(plyr)
+library(vars)
+all_industry <- dbGetQuery(con, "SELECT * from all_industry;")
+industry_list <- distinct(all_industry, Industry)
+
+for (j in 1: nrow(industry_list)){
+  selected_industry <- industry_list[1,]
+
+target_industry <- all_industry %>%
+  filter(Industry == selected_industry)
+stocks <- target_industry$symbol
+stock <- xts()
+for (i in 1:length(stocks)){
+  stock1 <- getSymbols(stocks[[i]],from = "2022-06-01", to = Sys.Date(), auto.assign = FALSE)
+  stock <- merge(stock,stock1[,4])
+}
+forecast_horizon <- 20
+Model <- VAR(stock, p = 1, type = "both")
+pred <- predict(Model, n.ahead = forecast_horizon, ci = 0.98, dumvar = NULL)
+var_pred <- data.frame(unlist(pred$fcst[1])[1:forecast_horizon])
+for (k in 2: nrow(target_industry)){
+  var_pred <- cbind(var_pred, unlist(pred$fcst[k])[1:forecast_horizon])
+}
+colnames(var_pred) <- colnames(stock)
+dbWriteTable(con, paste0("var_", selected_industry), var_pred)
+rm(var_pred)
+}
+```
+
+```{r}
+#dbWriteTable(con, paste0("var_", selected_industry), var_pred)
+#rm(var_pred)
+```
+
+
+## Cointegration 
+## Stationary test for multivariate time series
+# root() < 1 indicates stationary 
+```{r}
+roots(Model)
+```
+
+## Select optimal lag order
+```{r}
+VARselect(all_obj_diff, lag.max = 10, type = 'const')
+```
+
+## Diagnostic Testing 
+
+# Normality test
+```{r}
+normality.test(Model)
+```
+
+## Serial test
+# Leftover pattern in the residual. Close to 2 indicates no significant 
+```{r}
+serial.test(Model)
+```
+
+## Causality test
+#For CI = 95%, p value <0.05 indicates variable x cause y 
+```{r}
+causality(Model, cause = c("X0020.HK.Close", "X3800.HK.Close"))
+```
+
+
+
+
+```{r}#
+# Stationary Test
+#install.packages("aTSA")
+library(aTSA)
+# ADF test is used to determine the presence of unit root in the series and hence helps in understand if the series is stationary or not
+# The null hypothesis is rejected when p <= 0.05 => it's stationary. Otherwise, it is non stationary
+for (i in 1:ncol(all_obj)){
+  adf.test(all_obj[,i])
+}
+``` 
+
+
+```{r}
+library(dplyr)
+library(xgboost)
+train.Dmatrix <- train[,c(-1,-15)] %>% 
+  #dplyr::select(CloseDiff, OpenDiff, HighDiff, LowDiff, AdjustedDiff, macdDiff, signalDiff, rsiDiff, DCHighDiff, DCMidDiff,DCLowDiff) %>% 
+                 as.matrix() 
+                
+pred.Dmatrix <- var_pred[,-1] %>% 
+    #dplyr::select(CloseDiff, OpenDiff, HighDiff, LowDiff, AdjustedDiff, macdDiff, signalDiff, rsiDiff, DCHighDiff, DCMidDiff,DCLowDiff) %>% 
+                as.matrix() 
+targets <- train$pred
+```
+
+```{r}
+#Cross-validation
+#install.packages("caret")
+library(caret)
+xgb_trcontrol <- trainControl(
+  method = "cv", 
+  number = 10,
+  classProbs = TRUE,   
+  savePredictions = "final",
+#summaryFunction = twoClassSummary,
+  allowParallel = TRUE, 
+  verboseIter = FALSE, 
+  returnData = FALSE
+)
+
+#Building parameters set
+xgb_grid <- base::expand.grid(
+  list(
+    nrounds = seq(50,100),
+    max_depth = c(6,15,20), 
+    colsample_bytree = 1, 
+    eta = 0.5,
+    gamma = 0,
+    min_child_weight = 1,  
+    subsample = 1)
+)
+```
+
+```{r}
+#Building stocke model
+#install.packages("e1071")
+library(e1071)
+model.xgb <- caret::train(
+  train.Dmatrix,targets,
+  trControl = xgb_trcontrol,
+  tuneGrid = xgb_grid,
+  method = "xgbTree",
+  nthread = 10,
+  verbosity = 0
+)
+```
+
+```{r}
+model.xgb$bestTune
+```
+
+```{r}
+#Making stock variables used in forecast object 
+fitted <- model.xgb %>%
+  stats::predict(train.Dmatrix) %>%
+  stats::ts(start=c(2021,9), end =c(2022,5), frequency=365)
+
+ts.xautrygram <- ts(targets, start=c(2021,9), end =c(2022,5), frequency=365)
+forecast.xgb <- model.xgb %>% stats::predict(pred.Dmatrix)
+forecast.ts <- ts(forecast.xgb,start=c(2022,5),end =c(2022,7), frequency=365)
+
+#Preparing forecast object
+forecast.xautrygram <- list(
+  model = model.xgb$modelInfo,
+  method = model.xgb$method,
+  mean = forecast.ts,
+  
+  x = ts.xautrygram, 
+  fitted = fitted,
+  residuals = as.numeric(ts.xautrygram) - as.numeric(fitted)
+)
+class(forecast.xautrygram) <- "forecast"
+```
+
+```{r}
+#install.packages("Ckmeans.1d.dp")
+library(forecast)
+#Feature importance
+xgb.imp <- xgb.importance(
+  feature_names = colnames(train.Dmatrix),
+  model = model.xgb$finalModel)
+
+xgb.ggplot.importance(xgb.imp,n_clusters = c(2))+ 
+  ggtitle("") +
+  theme_bw()+
+  theme(legend.position="none")
+
+#xgb.imp$Importance
+```
+
+```{r}
+# predict values in test set
+y.preds = predict(model.xgb, var_pred)
+err <- mean(y.preds != test$pred[1:forecast_horizon])
+err
+```

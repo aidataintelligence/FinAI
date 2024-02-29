@@ -1,0 +1,162 @@
+---
+title: "Check Distribution"
+output: html_document
+date: "2023-07-08"
+---
+
+```{r}
+library(fitdistrplus)
+library(performance)
+library(TTR)
+library(quantmod) 
+library(tidyquant)
+library(forecast)
+library(ggplot2)
+library(fracdiff)
+library(PerformanceAnalytics)
+library(rugarch)
+library(parallel)
+library(RQuantLib) 
+library(readr)
+library(RPostgreSQL)
+library(priceR)
+library(dlookr)
+stock_df <- read_csv("E:/Fin AI/Allstocks1.csv")
+```
+
+```{r}
+con <- DBI::dbConnect(RPostgres::Postgres()
+                      , host='localhost'
+                      , port='5432'
+                      , dbname= 'fcst'
+                      , user='postgres'
+                      , password="Chui1234!")
+```
+
+```{r}
+dbRemoveTable(con, "distribution")
+dbRemoveTable(con, "distribution_fx")
+dbRemoveTable(con, "distribution_ind")
+```
+
+
+--- stock distribution---
+```{r}
+from_date <- "2023-01-01"
+n <- length(stock_df$symbol)
+pb <- txtProgressBar(min = 0, max = n, style=3)
+for (i in 1:length(stock_df$symbol)){
+    tryit <- try(
+      {
+      stock <- getSymbols(stock_df$symbol[[i]], from = from_date , to = Sys.Date(), auto.assign = FALSE)
+        return <- list()
+  # log return = log difference
+  return[[1]] <- na.omit(Return.calculate(stock[,4], method = "log"))
+  return[[2]] <- na.omit(Return.calculate(stock[,4], method = "difference"))
+  return[[3]] <- na.omit(Return.calculate(stock[,4], method = "discrete"))
+  return[[4]] <- na.omit(stock[,2] - stock[,3])
+  return[[5]] <- na.omit(VWAP(stock[,4], stock[,5]))
+  return[[6]] <- na.omit(diffseries(as.vector(stock[,4]), 0.5))
+distribution <- vector()
+  for (j in 1:6){
+  x <- check_distribution(as.vector(return[[j]]))
+  distribution[j] <-x[which.max(x$p_Vector),1]
+  }
+}
+                 )
+  if(inherits(tryit, "try-error")){
+    i <- i+1
+  } else {
+      df <- data.frame(stock_df$symbol[[i]], distribution[1], distribution[2], distribution[3], distribution[4], distribution[5], distribution[6])
+  colnames(df) <- c('symbol','log_return', 'diff', 'disc', 'ampl','vwap', 'frac')
+    dbWriteTable(con, "distribution", df, append = TRUE, row.names = FALSE)
+  rm(df)
+  }
+    setTxtProgressBar(pb, i)
+}
+```
+
+--- fx distribution---
+```{r}
+fx <- c("GBPHKD","EURHKD", "CNYHKD", "JPYHKD", "AUDHKD", "NZDHKD", "CADHKD", "CHFHKD", "XAUHKD", "XAGHKD", "XPDHKD", "XPTHKD")
+from <- c("GBP", "EUR", "CNY", "JPY", "AUD", "NZD", "CAD", "CHF", "XAU", "XAG", "XPD", "XPT")
+from_date <- "2023-01-01"
+
+n <- length(fx)
+pb <- txtProgressBar(min = 0, max = n, style=3)
+for (i in 1:length(fx)){
+    tryit <- try(fx_data <- historical_exchange_rates(from = from[i], to = "HKD", start_date = from_date, end_date = Sys.Date()))
+  if(inherits(tryit, "try-error")){
+    i <- i+1
+  } else {
+  return <- list()
+  fx_data <- xts(fx_data[, -1], order.by=as.Date(fx_data$date))
+  # log return = log difference
+  return[[1]] <- na.omit(Return.calculate(fx_data, method = "log"))
+  return[[2]] <- na.omit(Return.calculate(fx_data, method = "difference"))
+  return[[3]] <- na.omit(Return.calculate(fx_data, method = "discrete"))
+  return[[4]] <- na.omit(diffseries(as.vector(fx_data), 0.5))
+
+distribution <- vector()
+  for (j in 1:4){
+  x <- check_distribution(as.vector(return[[j]]))
+  distribution[j] <-x[which.max(x$p_Vector),1]
+  }
+      df <- data.frame(fx[i], distribution[1], distribution[2], distribution[3], distribution[4])
+  colnames(df) <- c('fx','log_return', 'diff', 'disc', 'frac')
+    dbWriteTable(con, "distribution_fx", df, append = TRUE, row.names = FALSE)
+  rm(df)
+  }
+    setTxtProgressBar(pb, i)
+}
+```
+
+--- index distribution---
+```{r}
+ind <- c("^N225","^HSI", "^GSPC", "^DJI", "^IXIC", "^TNX", "^FTSE")
+n <- length(ind)
+pb <- txtProgressBar(min = 0, max = n, style=3)
+for (i in 1:length(ind)){
+    tryit <- try(
+      {
+      index_data <- getSymbols(ind[i], from = from_date, to = Sys.Date(),auto.assign =FALSE)
+        return <- list()
+  #index_data <- xts(index_data[, -1], order.by=as.Date(index_data$date))
+  # log return = log difference
+  return[[1]] <- na.omit(Return.calculate(index_data[,4], method = "log"))
+  return[[2]] <- na.omit(Return.calculate(index_data[,4], method = "difference"))
+  return[[3]] <- na.omit(Return.calculate(index_data[,4], method = "discrete"))
+  return[[4]] <- na.omit(index_data[,2] - index_data[,3])
+  return[[5]] <- na.omit(VWAP(index_data[,4], index_data[,5]))
+  return[[6]] <- na.omit(diffseries(as.vector(index_data[,4]), 0.5))
+distribution <- vector()
+  for (j in 1:4){
+  x <- check_distribution(as.vector(return[[j]]))
+  distribution[j] <-x[which.max(x$p_Vector),1]
+  }
+      df <- data.frame(ind[i], distribution[1], distribution[2], distribution[3], distribution[4], distribution[5], distribution[6])
+  colnames(df) <- c('ind','log_return', 'diff', 'disc', 'ampl','vwap', 'frac')
+      }
+      )
+  if(inherits(tryit, "try-error")){
+    i <- i+1
+  } else {
+
+    dbWriteTable(con, "distribution_ind", df, append = TRUE, row.names = FALSE)
+  rm(df)
+  }
+    setTxtProgressBar(pb, i)
+}
+
+```
+
+
+```{r}
+distribution <- dbGetQuery(con, "SELECT * from distribution;")
+```
+
+```{r}
+distribution[,2:7] <- lapply(distribution[,2:7], as.factor)
+summary(distribution)
+```
+

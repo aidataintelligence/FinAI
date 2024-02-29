@@ -1,0 +1,237 @@
+---
+title: "Download Data"
+output: html_document
+date: "2023-04-18"
+---
+
+```{r}
+library(quantmod)
+library(tidyquant)
+library(tidyverse)
+library(readr)
+library(pastecs)
+library(PerformanceAnalytics)
+library(lubridate)
+library(taskscheduleR)
+library(RPostgreSQL)
+library(reshape2)
+library(priceR)
+library(psych)
+#stock_df <- read_csv("Allsymbols.csv")
+stock_df <- read_csv("Allstocks.csv")
+#stock_df <- stock_df %>%
+  #filter(`Div Stock` == "N")
+```
+
+```{r}
+con <- DBI::dbConnect(RPostgres::Postgres()
+                      , host='localhost'
+                      , port='5432'
+                      , dbname= 'postgres'
+                      , user='postgres'
+                      , password="Chui1234!")
+```
+
+```{r}
+from_date <- "2024-02-02"
+```
+
+```{r}
+cl <- dbGetQuery(con, "SELECT * from cl;")
+div <- dbGetQuery(con, "SELECT * from div;")
+```
+
+```{r}
+n <- length(stock_df$symbol)
+pb <- txtProgressBar(min = 0, max = n, style=3)
+div_append <- data.frame(matrix(ncol = 3, nrow = 0))
+colnames(div_append) <- c("date", "value", "symbol")
+for (i in 1: length(stock_df$symbol)){
+  tryit <- try(
+    {
+div1 <- getDividends(stock_df$symbol[[i]],from = from_date, to = Sys.Date())
+div1 <- data.frame(date = index(div1), coredata(div1))
+div1 <- data.frame(div1, stock_df$symbol[[i]])
+colnames(div1) <- c("date", "value", "symbol")
+div_append <- rbind(div_append, div1)
+}
+  )
+  if(inherits(tryit, "try-error")){
+    i <- i+1
+  } 
+    setTxtProgressBar(pb, i)
+}
+```
+
+```{r}
+cl_append <- tq_get(stock_df$symbol, get = "stock.prices", from = from_date, to = Sys.Date())
+cl <- rbind(cl, cl_append)
+div_append$year <- format(div_append$date, "%Y")
+div_append$month <- format(div_append$date, "%m")
+div_append$ref_date <- as.Date(ifelse(div_append$year == 2024, div_append$date, div_append$date %m+% years(1)), origin = "1970-01-01")
+div_append$expired <- "Y" 
+#ifelse(div$ref_date < Sys.Date(),"Y", "N")
+div <- rbind(div, div_append)
+#cl_append <- cl_append %>%
+  #filter(date == Sys.Date())
+```
+
+```{r}
+stock_df <- left_join(stock_df, cl_append[,c(1,6)], by = "symbol")
+stock_df$min_pay <- stock_df$`Board Lot`*stock_df$close
+
+cl_avg <- cl
+cl_avg$year <- format(cl_avg$date, "%Y")
+cl_avg$month <- format(cl_avg$date, "%m")
+
+cl_avg_mo <- cl_avg %>%
+  group_by(symbol, year, month) %>%
+  summarise(max = max(high, na.rm=TRUE), min = min(low, na.rm=TRUE), mo_avg = mean(close))
+
+cl_avg_mo$range <- cl_avg_mo$max - cl_avg_mo$min
+cl_avg_mo$max_return <- cl_avg_mo$range/cl_avg_mo$min
+
+cl_avg_yr <- cl_avg %>%
+  group_by(symbol, year) %>%
+  summarise(max = max(high, na.rm=TRUE), min = min(low, na.rm=TRUE), yr_avg = mean(close))
+
+cl_avg_yr$range <- cl_avg_yr$max - cl_avg_yr$min
+cl_avg_yr$max_return <- cl_avg_yr$range/cl_avg_yr$min
+
+stock_df <- left_join(stock_df, filter(cl_avg_yr, year == 2024), by = "symbol")
+
+stock_df$quantile <- (stock_df$close - stock_df$min)/stock_df$range
+
+div_this_yr <- div %>%
+  filter(expired == "N") %>%
+  select("symbol", "ref_date", "value")
+
+commission <- 0.002
+div_fee <- 0.005
+
+div_this_yr <- left_join(div_this_yr, stock_df[,c(1,2,5,9,12:20)], by = "symbol")
+
+div_this_yr$div <- div_this_yr$value*div_this_yr$`Board Lot`
+
+div_this_yr$commission <- ifelse(div_this_yr$min_pay*commission < 50, 50, div_this_yr$min_pay*commission)
+div_this_yr$div_fee <- ifelse(div_this_yr$min_pay*div_fee < 30, 30, div_this_yr$min_pay*div_fee)
+div_this_yr$return<- round((div_this_yr$div - div_this_yr$commission*2 - div_this_yr$div_fee)/div_this_yr$min_pay,2)
+
+div_summary <- div_this_yr %>%
+    group_by(symbol) %>% 
+    summarize(div = sum(div), div_fee= sum(div_fee), commission = mean(commission), min_pay =
+                mean(min_pay), latest_ex_date = max(ref_date))
+
+div_summary$return <- round((div_summary$div - div_summary$commission*2 - div_summary$div_fee)/div_summary$min_pay,2)
+
+div_summary$day_to_ex <- as.numeric(as.Date(div_summary$latest_ex_date, "%d-%b-%y") - Sys.Date())
+```
+
+```{r}
+dbRemoveTable(con, "cl")
+dbRemoveTable(con, "cl_avg_yr")
+dbRemoveTable(con, "cl_avg_mo")
+dbRemoveTable(con, "div")
+dbRemoveTable(con, "div_this_yr")
+dbRemoveTable(con, "div_summary")
+dbRemoveTable(con, "stock_df")
+```
+
+```{r}
+dbWriteTable(con, "cl", cl)
+dbWriteTable(con, "cl_avg_yr", cl_avg_yr)
+dbWriteTable(con, "cl_avg_mo", cl_avg_mo)
+dbWriteTable(con, "div", div)
+dbWriteTable(con, "div_this_yr", div_this_yr)
+dbWriteTable(con, "div_summary", div_summary)
+dbWriteTable(con, "stock_df", stock_df)
+```
+
+
+### error: don't run 
+--- fx ---
+```{r}
+Sys.setenv("EXCHANGERATEHOST_ACCESS_KEY"="d2bdd74c8495b93a0958038c8aa20b35")
+
+fx <- c("GBPHKD","EURHKD", "CNYHKD", "JPYHKD", "AUDHKD", "NZDHKD", "CADHKD", "CHFHKD", "XAUHKD", "XAGHKD", "XPDHKD", "XPTHKD")
+from <- c("GBP", "EUR", "CNY", "JPY", "AUD", "NZD", "CAD", "CHF", "XAU", "XAG", "XPD", "XPT")
+for (i in 1:length(fx)){
+  fx_data <- historical_exchange_rates(from = from[i], to = "HKD", start_date = from_date, end_date = Sys.Date())
+  colnames(fx_data) <- c("date", fx[i])
+  dbWriteTable(con, fx[i] , fx_data, append = TRUE, row.names = FALSE)
+}
+```
+
+# Work Around for fx 
+```{r}
+from_date <- "2020-01-01"
+Sys.setenv("EXCHANGERATEHOST_ACCESS_KEY"="d2bdd74c8495b93a0958038c8aa20b35")
+
+# GBPHKD
+fx_data <- historical_exchange_rates(from = "GBP", to = "HKD", start_date = from_date, end_date = Sys.Date())
+colnames(fx_data) <- c("date", "GBPHKD")
+dbWriteTable(con, "GBPHKD" , fx_data, append = TRUE, row.names = FALSE)
+
+# EURHKD
+fx_data <- historical_exchange_rates(from = "EUR", to = "HKD", start_date = from_date, end_date = Sys.Date())
+colnames(fx_data) <- c("date", "EURHKD")
+dbWriteTable(con, "EURHKD" , fx_data, append = TRUE, row.names = FALSE)
+
+fx_data <- historical_exchange_rates(from = "CNY", to = "HKD", start_date = from_date, end_date = Sys.Date())
+colnames(fx_data) <- c("date", "CNYHKD")
+dbWriteTable(con, "CNYHKD" , fx_data, append = TRUE, row.names = FALSE)
+
+fx_data <- historical_exchange_rates(from = "AUD", to = "HKD", start_date = from_date, end_date = Sys.Date())
+colnames(fx_data) <- c("date", "AUDHKD")
+dbWriteTable(con, "AUDHKD" , fx_data, append = TRUE, row.names = FALSE)
+
+fx_data <- historical_exchange_rates(from = "NZD", to = "HKD", start_date = from_date, end_date = Sys.Date())
+colnames(fx_data) <- c("date", "NZDHKD")
+dbWriteTable(con, "NZDHKD" , fx_data, append = TRUE, row.names = FALSE)
+
+fx_data <- historical_exchange_rates(from = "CAD", to = "HKD", start_date = from_date, end_date = Sys.Date())
+colnames(fx_data) <- c("date", "CADHKD")
+dbWriteTable(con, "CADHKD" , fx_data, append = TRUE, row.names = FALSE)
+
+fx_data <- historical_exchange_rates(from = "CHF", to = "HKD", start_date = from_date, end_date = Sys.Date())
+colnames(fx_data) <- c("date", "CHFHKD")
+dbWriteTable(con, "CHFHKD" , fx_data, append = TRUE, row.names = FALSE)
+
+fx_data <- historical_exchange_rates(from = "XAU", to = "HKD", start_date = from_date, end_date = Sys.Date())
+colnames(fx_data) <- c("date", "XAUHKD")
+dbWriteTable(con, "XAUHKD" , fx_data, append = TRUE, row.names = FALSE)
+
+fx_data <- historical_exchange_rates(from = "XAG", to = "HKD", start_date = from_date, end_date = Sys.Date())
+colnames(fx_data) <- c("date", "XAGHKD")
+dbWriteTable(con, "XAGHKD" , fx_data, append = TRUE, row.names = FALSE)
+```
+
+
+--- ind ---
+```{r}
+ind <- c("^N225","^HSI", "^GSPC", "^DJI", "^IXIC", "^TNX", "^FTSE")
+ind_1 <- c("N225","HSI", "GSPC", "DJI", "IXIC", "TNX", "FTSE")
+for (i in 1:length(ind)){
+  index_data <- getSymbols(ind[i], from = from_date, to = Sys.Date(), auto.assign = FALSE)
+  colnames(index_data) <- c("open","high","low","close","volume","adjusted")
+  dbWriteTable(con, ind_1[i] , data.frame(date = index(index_data), coredata(index_data)), append = FALSE, row.names = FALSE)
+}
+```
+-- Explore AMEX
+```{r}
+#Fred https://fred.stlouisfed.org/
+tq_exchange("AMEX")
+tq_get("GDP", get = "economic.data", complete_cases = TRUE)
+tq_get("UNRATE", get = "economic.data", complete_cases = TRUE)
+tq_get("REAINTRATREARAT10Y", get = "economic.data", complete_cases = TRUE)
+
+```
+
+```{r}
+tq_get(c("btcusd", "btceur"),
+       get    = "tiingo.crypto",
+       from   = "2020-01-01",
+       to     = "2020-01-15",
+       resample_frequency = "5min")
+```
+

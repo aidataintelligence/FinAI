@@ -1,0 +1,286 @@
+---
+title: "Correlation"
+output: html_document
+date: "2022-12-21"
+---
+
+```{r}
+#install.packages("tseries")
+#install.packages("dlookr")
+library(dlookr)
+library(tseries)
+library(quantmod) 
+library(tidyquant)
+library(readr)
+library(quantmod)
+library(TTR)
+library(PerformanceAnalytics)
+library(dplyr)
+library(reshape2)
+library(psych)
+library(RPostgreSQL)
+library(NlinTS)
+```
+
+```{r}
+con <- DBI::dbConnect(RPostgres::Postgres()
+                      , host='localhost'
+                      , port='5432'
+                      , dbname= 'postgres'
+                      , user='postgres'
+                      , password="Chui1234!")
+```
+
+```{r}
+cl <- dbGetQuery(con, "SELECT * from cl;")
+```
+
+```{r}
+from_date <- "2022-01-01"
+```
+
+
+```{r}
+getSymbols("^HSI", from = from_date, to = Sys.Date())
+HSI <- data.frame(date = index(HSI), coredata(HSI))
+HSI <- data.frame("HSI", HSI)
+colnames(HSI) <- colnames(cl)
+cl <- rbind(cl, HSI)
+cl <- cl %>%
+  filter(date > from_date)
+cl_df <- dcast(cl, date ~ symbol, fun.aggregate = sum, value.var = 'close')
+#cl.df <- left_join(cl.df,HSI[,1:2],by = "date")
+cl_df <- na.omit(cl_df)
+describe_cl <- psych::describe(cl_df[,2:2846])
+describe_cl <- as.data.frame(describe_cl)
+#density <- density(cl_df[,2])
+#plot(density)
+#norm_df <- dlookr::normality(as.data.frame(cl_df))
+#norm_df$norm_test <- ifelse(norm_df$p_value > 0.05, "yes", "no")
+#View(norm_df)
+#plot_normality(as.data.frame(cl_df))
+```
+
+```{r}
+# Select columns by name
+#HSI_correlation <- correlate(cl_df, "HSI")
+#HSI_correlation <- as.data.frame(HSI_correlation)
+```
+
+
+```{r}#
+# H0 is the null hypothesis that X does not cause Y. Under H0, F follows the Fisher distribution
+#(p, n − 2p − 1) as degrees of freedom.
+# p_value =< 0.05, reject null h. 
+x <- cl_df[472:673,]
+for (i in 1: 2844)
+test = causality.test(x[,2], x[,2845], 1)
+y <- test$summary()
+#nlin_causality.test(x[,2], x[,2845], 1)
+```
+
+
+```{r}
+symbol_list <- cl %>%
+distinct(symbol)
+
+TI_correlation <- data.frame(matrix(ncol = 4, nrow = 0))
+n <- length(symbol_list$symbol)
+pb <- txtProgressBar(min = 0, max = n, style=3)
+
+stock_all <- data.frame(matrix(ncol = 15, nrow = 0))
+for (i in 1:length(symbol_list$symbol))
+{
+  tryit <- try(
+    {
+stock <- cl %>%
+filter(symbol == symbol_list[i,])%>%
+  arrange(date)
+
+# Momentum Indicators
+stock$rsi <- RSI(stock[,6])
+stock$ROC <- ROC(stock[,6])
+
+# Volume Indicators
+#stock$cmf <- CMF(stock[,4:6], stock[,7])
+#stock$mfi <- MFI(stock[,4:6], stock[,7], n = 14)
+stock$obv <- OBV(stock[,6], stock[,7])
+
+# Volatility Indicators
+#stock$bbands <- BBands(stock[,4:6])
+#stock$atr <- ATR(stock[,4:6], n = 14)
+#stock$kc <-keltnerChannels(stock[,4:6])
+
+# Trend Indicators 
+stock$sma_10 <- SMA(stock[,6], n = 10)
+#stock$sma_50 <- SMA(stock[,6], n = 50)
+#stock$adx <- ADX(stock[,4:6], n = 14)
+
+# Resistance & Support
+stock[,c("resistance", "mid", "support")] <- DonchianChannel(stock[,c("high","low")])
+stock$vwap <- VWAP(stock[,6], stock[,7])
+stock_all <- rbind(stock_all, stock)
+TI_new <- correlate(stock[3:14], "close")
+TI_new <- data.frame(symbol_list[i,], TI_new)
+colnames(TI_correlation[1]) <- "symbol"
+TI_correlation <- rbind(TI_correlation, TI_new)
+}
+  )
+  if(inherits(tryit, "try-error")){
+    i <- i+1
+  } 
+    setTxtProgressBar(pb, i)
+}
+```
+
+
+```{r}
+# Momentum Indicators
+HSI$rsi <- RSI(HSI[,6])
+#HSI$stoch <- stoch(HSI[,4:6])
+HSI$macd <- MACD(HSI[,6], 12, 26, 9, maType = "EMA")
+HSI$cci <- CCI(HSI[,4:6], n = 10)
+
+#Volume Indicators
+HSI$cmf <- CMF(HSI[,4:6], HSI[,7])
+HSI$mfi <- MFI(HSI[,4:6], HSI[,7], n = 14)
+HSI$obv <- OBV(HSI[,6], HSI[,7])
+
+#Volatility Indicators
+HSI$bbands <- BBands(HSI[,4:6])
+HSI$atr <- ATR(HSI[,4:6], n = 14)
+HSI$kc <-keltnerChannels(HSI[,4:6])
+
+#Trend Indicators 
+HSI$sma_10 <- SMA(HSI[,6], n = 10)
+HSI$sma_50 <- SMA(HSI[,6], n = 50)
+HSI$adx <- ADX(HSI[,4:6], n = 14)
+```
+
+# Industry Correlation
+```{r}
+all_industry <- dbGetQuery(con, "SELECT * from all_industry;")
+industry_list <- all_industry%>%
+  distinct(Industry)
+```
+
+```{r}
+industry_corr <- data.frame(matrix(ncol = 3, nrow = 0))
+n <- nrow(industry_list)
+pb <- txtProgressBar(min = 0, max = n, style=3)
+for (i in 1: nrow(industry_list)){
+  target_industry <- all_industry %>%
+  filter(Industry == industry_list[i,])
+  stocks <- target_industry$symbol
+      tryit <- try(
+      {
+        stock <- cl %>%
+          filter(symbol %in% stocks) %>%
+          filter(date > from_date)
+      
+        cl_df <- dcast(stock, date ~ symbol, fun.aggregate = sum, value.var = 'close')
+        cl_df <- na.omit(cl_df)
+        for (j in 1:length(stocks))
+        {
+          industry_new <- correlate(cl_df[2:ncol(cl_df)], stocks[j])
+          industry_corr <- rbind(industry_corr, industry_new)
+        }
+      })
+        if(inherits(tryit, "try-error")){
+    i <- i+1
+  } 
+    setTxtProgressBar(pb, i)
+}
+industry_corr <- as.data.frame(industry_corr)
+```
+
+```{r}
+dbRemoveTable(con, "HSI_correlation")
+dbRemoveTable(con, "describe_cl")
+dbRemoveTable(con, "TI_correlation")
+dbRemoveTable(con, "Industry_correlation") 
+dbRemoveTable(con, "HSI_ti")
+dbRemoveTable(con, "stock_all_ti")
+```
+
+```{r}
+dbWriteTable(con, "HSI_correlation", HSI_correlation)
+dbWriteTable(con, "describe_cl", describe_cl)
+dbWriteTable(con, "TI_correlation", TI_correlation)
+dbWriteTable(con, "Industry_correlation", industry_corr)
+dbWriteTable(con, "stock_all_ti", stock_all)
+dbWriteTable(con, "HSI_ti", HSI)
+```
+
+
+
+----new
+```{r}
+HSI <- dbGetQuery(con, "SELECT * from HSI;")
+GSPC <- dbGetQuery(con, "SELECT * from GSPC;")
+Interest_Rate <- read_csv("C:/Users/datai/Desktop/Interest Rate.csv",
+col_types = cols(date = col_date(format = "%d/%m/%Y"),
+`Interest rate` = col_number(), `US Inflation` = col_number(),
+`HK Inflation` = col_number(), `HIBOR_1 Month` = col_number(), CCI = col_number()))
+```
+
+```{r}
+HSI <- HSI[,c(1,5)]
+GSPC <- GSPC[,c(1,5)]
+Interest_Rate <- left_join(Interest_Rate, HSI, by = "date")
+Interest_Rate <- left_join(Interest_Rate, GSPC, by = "date")
+```
+
+
+
+```{r}
+Interest_Rate <- left_join(Interest_Rate, AUDHKD, by = "date")
+Interest_Rate <- left_join(Interest_Rate, CADHKD, by = "date")
+Interest_Rate <- left_join(Interest_Rate, CNYHKD, by = "date")
+Interest_Rate <- left_join(Interest_Rate, CHFHKD, by = "date")
+Interest_Rate <- left_join(Interest_Rate, EURHKD, by = "date")
+Interest_Rate <- left_join(Interest_Rate, JPYHKD, by = "date")
+Interest_Rate <- left_join(Interest_Rate, GBPHKD, by = "date")
+Interest_Rate <- left_join(Interest_Rate, NZDHKD, by = "date")
+Interest_Rate <- left_join(Interest_Rate, XAUHKD, by = "date")
+Interest_Rate <- left_join(Interest_Rate, XPTHKD, by = "date")
+Interest_Rate <- left_join(Interest_Rate, XAGHKD, by = "date")
+Interest_Rate <- left_join(Interest_Rate, XPDHKD, by = "date")
+```
+
+
+
+# Industry Correlation
+```{r}
+all_industry <- dbGetQuery(con, "SELECT * from all_industry;")
+cl <- dbGetQuery(con, "SELECT * from cl;")
+industry_list <- all_industry%>%
+  distinct(Industry)
+```
+
+```{r}
+industry_corr <- data.frame(matrix(ncol = 3, nrow = 0))
+#bank_industry <- all_industry %>%
+  #filter(Industry == "Banks")
+#stocks <- bank_industry$symbol
+property_industry <- all_industry %>%
+  filter(Industry == "Property Development")
+stocks <- property_industry$symbol
+stock <- cl %>%
+  filter(symbol %in% stocks) 
+cl_df <- dcast(stock, date ~ symbol, fun.aggregate = sum, value.var = 'close')
+cl_df <- na.omit(cl_df)
+```
+
+```{r}
+Interest_Rate <- left_join(Interest_Rate, cl_df, by = "date")
+```
+
+```{r}
+interest_correlation <- correlate(Interest_Rate, "Interest rate")
+```
+
+```{r}
+dbWriteTable(con, "interest_correlation", as.data.frame(interest_correlation))
+```
+

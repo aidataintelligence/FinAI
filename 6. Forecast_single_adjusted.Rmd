@@ -1,0 +1,332 @@
+---
+title: "Forecast_single_adjusted"
+output: html_document
+date: "2023-04-04"
+---
+
+```{r}
+library(TTR)
+library(quantmod) 
+library(tidyquant)
+library(forecast)
+library(ggplot2)
+library(fracdiff)
+library(PerformanceAnalytics)
+library(rugarch)
+library(parallel)
+library(RQuantLib) 
+library(readr)
+library(RPostgreSQL)
+library(priceR)
+stock_df <- read_csv("Allstocks1.csv")
+```
+
+```{r}
+con <- DBI::dbConnect(RPostgres::Postgres()
+                      , host='localhost'
+                      , port='5432'
+                      , dbname= 'fcst'
+                      , user='postgres'
+                      , password="Chui1234!")
+```
+
+```{r}
+dbRemoveTable(con, "fcst_1")
+#dbRemoveTable(con, "fcst_fx")
+#dbRemoveTable(con, "fcst_ind")
+```
+
+```{r}
+from_date <- "2024-01-01"
+forecast_horizon <- 20
+HK_future_holiday  <- holidayList(calendar="HongKong", from = Sys.Date() , to = as.Date("2024-12-31"),
+                          includeWeekends = TRUE)
+holidays <- sum(HK_future_holiday < (Sys.Date() + forecast_horizon ))
+holidays1 <- sum(HK_future_holiday < (Sys.Date() + forecast_horizon + holidays ))
+```
+
+
+
+---stock---
+```{r}
+forecast_horizon <- 20
+HK_future_holiday  <- holidayList(calendar="HongKong", from = Sys.Date() , to = as.Date("2024-12-31"),
+                          includeWeekends = TRUE)
+holidays <- sum(HK_future_holiday < (Sys.Date() + forecast_horizon ))
+holidays1 <- sum(HK_future_holiday < (Sys.Date() + forecast_horizon + holidays ))
+
+n <- length(stock_df$symbol)
+pb <- txtProgressBar(min = 0, max = n, style=3)
+
+for (i in 1:length(stock_df$symbol)){
+    tryit <- try(
+      {
+
+        stock <- getSymbols(stock_df$symbol[[i]], from = from_date , to = Sys.Date(), auto.assign = FALSE)
+        colnames(stock) <- c("open","high","low","close","volume","adjusted")
+  #return <- na.omit(Return.calculate(stock$close, method = "log"))
+  Stock <- na.omit(diff(stock[,4],1))
+  colnames(Stock) <- "y"
+  df <- data.frame(ds = index(Stock), coredata(Stock))
+  future <- setNames(data.frame(seq(max(df$ds)+1, by = "day", length.out = forecast_horizon + holidays1 )), "ds")
+  future <- future[which(!future$ds %in% HK_future_holiday),]
+  
+  
+  # Automatic ARIMA forecasts
+  model_arima <- Stock %>%
+  auto.arima() %>%
+  forecast::forecast(h = forecast_horizon) 
+
+  # Neural Network
+  model_nnetwork <- Stock %>%
+  nnetar() %>%
+  forecast::forecast(h = forecast_horizon)
+  
+  # Garch
+  spec <- ugarchspec(variance.model = list(model = "csGARCH"), mean.model = list(arfima=TRUE), distribution.model = "norm") 
+  spec1 <- ugarchspec(variance.model = list(model = "apARCH"), mean.model = list(arfima=TRUE), distribution.model = "norm")  
+  # Parameter Estimation 
+  fit <- ugarchfit(spec, Stock, solver = "hybrid"
+                 #, out.sample = test
+                 )
+  fit1 <- ugarchfit(spec1, Stock, solver = "hybrid"
+                 #, out.sample = test
+                 )
+  # Forecast
+  model_garch <- ugarchforecast(fit, n.ahead = forecast_horizon)
+  model_garch_1 <- ugarchforecast(fit1, n.ahead = forecast_horizon)
+
+  # Inverse of transformation
+  fcst_garch <- round(diffinv(model_garch@forecast[["seriesFor"]], lag = 1, differences = 1, xi = stock[nrow(stock),4] )[-1], digits = 2)
+  fcst_garch_1 <- round(diffinv(model_garch_1@forecast[["seriesFor"]], lag = 1, differences = 1, xi = stock[nrow(stock),4] )[-1], digits = 2)
+  fcst_arima <- round(diffinv(model_arima$mean, lag = 1, differences = 1, xi = stock[nrow(stock),4] )[-1], digits = 2)
+  fcst_nnetwork <- round(diffinv(model_nnetwork$mean, lag = 1, differences = 1, xi = stock[nrow(stock),4] )[-1], digits = 2)
+  
+  fcst <- data.frame(stock_df$symbol[[i]], future, fcst_arima, fcst_nnetwork, fcst_garch, fcst_garch_1)
+  colnames(fcst)[c(1:2,5:6)] <- c('symbol','ds', 'fcst_garch_cs', 'fcst_garch_ap')
+    dbWriteTable(con, "fcst_1", fcst, append = TRUE, row.names = FALSE)
+  rm(fcst)
+      })
+  if(inherits(tryit, "try-error")){
+    i <- i+1
+  } 
+    setTxtProgressBar(pb, i)
+}
+```
+
+
+---interest_rate
+```{r} 
+library(xts)
+FEDFUNDS <- read_csv("C:/Users/datai/Desktop/FEDFUNDS.csv",
+col_types = cols(DATE = col_date(format = "%Y-%m-%d")))
+fed <- xts(FEDFUNDS$FEDFUNDS, FEDFUNDS$DATE)
+return <- na.omit(Return.calculate(fed, method = "log"))
+  
+  # Automatic ARIMA forecasts
+  model_arima <- return %>%
+  auto.arima() %>%
+  forecast::forecast(h = forecast_horizon) 
+
+  # Neural Network
+  model_nnetwork <- return %>%
+  nnetar() %>%
+  forecast::forecast(h = forecast_horizon)
+  
+  df <- data.frame(ds = index(return), coredata(return))
+  future <- setNames(data.frame(seq(max(df$ds)+1, by = "day", length.out = forecast_horizon + holidays1 )), "ds")
+  future <- future[which(!future$ds %in% HK_future_holiday),]
+  
+  # Garch
+  spec <- ugarchspec(variance.model = list(model = "csGARCH"), mean.model = list(arfima=TRUE), distribution.model = "norm") 
+  spec1 <- ugarchspec(variance.model = list(model = "apARCH"), mean.model = list(arfima=TRUE), distribution.model = "norm")  
+  # Fit model
+  # Parameter Estimation 
+  fit <- ugarchfit(spec, return, solver = "hybrid"
+                 #, out.sample = test
+                 )
+  fit1 <- ugarchfit(spec1, return, solver = "hybrid"
+                 #, out.sample = test
+                 )
+  # Forecast
+  model_garch <- ugarchforecast(fit, n.ahead = forecast_horizon)
+  model_garch_1 <- ugarchforecast(fit1, n.ahead = forecast_horizon)
+  
+  fcst_garch <- last(FEDFUNDS$FEDFUNDS)*exp(model_garch@forecast[["seriesFor"]])[1]
+  fcst_garch_1 <- last(FEDFUNDS$FEDFUNDS)*exp(model_garch_1@forecast[["seriesFor"]])[1]
+  fcst_arima <- last(FEDFUNDS$FEDFUNDS)*exp(model_arima$mean)[1]
+  fcst_nnetwork <- last(FEDFUNDS$FEDFUNDS)*exp(model_nnetwork$mean)[1]
+for (j in 2: forecast_horizon){
+  fcst_garch <- rbind(fcst_garch,
+                      fcst_garch[j-1]*exp(model_garch@forecast[["seriesFor"]])[j])
+  fcst_garch_1 <- rbind(fcst_garch_1,
+                      fcst_garch_1[j-1]*exp(model_garch_1@forecast[["seriesFor"]])[j])
+  fcst_arima <- rbind(fcst_arima,
+                      fcst_arima[j-1]*exp(model_arima$mean)[j])
+  fcst_nnetwork <- rbind(fcst_nnetwork,
+                      fcst_nnetwork[j-1]*exp(model_arima$mean[j]))
+  }
+
+  fcst <- data.frame(future, fcst_arima, fcst_nnetwork, fcst_garch, fcst_garch_1)
+  fcst[,2:5] <- round(fcst[,2:5], digits = 2)
+  colnames(fcst) <- c('ds', 'fcst_arima', 'fcst_nnetwork','fcst_garch_cs', 'fcst_garch_ap')
+  dbWriteTable(con, "fcst_int", fcst, append = TRUE, row.names = FALSE)
+```
+
+
+
+---fx---
+---log return---
+```{r} 
+from_date <- "2023-07-01"
+Sys.setenv("EXCHANGERATEHOST_ACCESS_KEY"="d2bdd74c8495b93a0958038c8aa20b35")
+fx_obj <- list()
+fx <- c("GBPHKD","EURHKD", "CNYHKD", "JPYHKD", "AUDHKD", "NZDHKD", "CADHKD", "CHFHKD", "XAUHKD", "XAGHKD", "XPDHKD", "XPTHKD")
+from <- c("GBP", "EUR", "CNY", "JPY", "AUD", "NZD", "CAD", "CHF", "XAU", "XAG", "XPD", "XPT")
+
+n <- length(fx)
+pb <- txtProgressBar(min = 0, max = n, style=3)
+
+for (i in 1:length(fx)){
+    tryit <- try(
+      {
+       fx_obj <- historical_exchange_rates(from = from[i], to = "HKD", start_date = from_date, end_date = Sys.Date())
+  #colnames(fx_obj) <- c("date", fx[i])
+  fx_xts <- as.xts(fx_obj)
+  return <- na.omit(Return.calculate(fx_xts, method = "log"))
+  #colnames(return) <- "y"
+  
+  # Automatic ARIMA forecasts
+  model_arima <- return %>%
+  auto.arima() %>%
+  forecast::forecast(h = forecast_horizon) 
+
+  # Neural Network
+  model_nnetwork <- return %>%
+  nnetar() %>%
+  forecast::forecast(h = forecast_horizon)
+  
+  df <- data.frame(ds = index(return), coredata(return))
+
+  future <- setNames(data.frame(seq(max(df$ds)+1, by = "day", length.out = forecast_horizon + holidays1 )), "ds")
+  
+  future <- future[which(!future$ds %in% HK_future_holiday),]
+  
+  # Garch
+  spec <- ugarchspec(variance.model = list(model = "csGARCH"), mean.model = list(arfima=TRUE), distribution.model = "norm") 
+  spec1 <- ugarchspec(variance.model = list(model = "apARCH"), mean.model = list(arfima=TRUE), distribution.model = "norm")  
+  # Fit model
+  # Parameter Estimation 
+  fit <- ugarchfit(spec, return, solver = "hybrid"
+                 #, out.sample = test
+                 )
+  fit1 <- ugarchfit(spec1, return, solver = "hybrid"
+                 #, out.sample = test
+                 )
+  # Forecast
+  model_garch <- ugarchforecast(fit, n.ahead = forecast_horizon)
+  model_garch_1 <- ugarchforecast(fit1, n.ahead = forecast_horizon)
+  
+  fcst_garch <- last(fx_xts)*exp(model_garch@forecast[["seriesFor"]])[1]
+  fcst_garch_1 <- last(fx_xts)*exp(model_garch_1@forecast[["seriesFor"]])[1]
+  fcst_arima <- last(fx_xts)*exp(model_arima$mean)[1]
+  fcst_nnetwork <- last(fx_xts)*exp(model_nnetwork$mean)[1]
+
+  for (j in 2: forecast_horizon){
+  fcst_garch <- rbind(fcst_garch,
+                      fcst_garch[j-1]*exp(model_garch@forecast[["seriesFor"]])[j])
+  fcst_garch_1 <- rbind(fcst_garch_1,
+                      fcst_garch_1[j-1]*exp(model_garch_1@forecast[["seriesFor"]])[j])
+  fcst_arima <- rbind(fcst_arima,
+                      fcst_arima[j-1]*exp(model_arima$mean)[j])
+  fcst_nnetwork <- rbind(fcst_nnetwork,
+                      fcst_nnetwork[j-1]*exp(model_arima$mean[j]))
+  }
+
+  fcst <- data.frame(fx[i], future, fcst_arima, fcst_nnetwork, fcst_garch, fcst_garch_1)
+  fcst[,3:6] <- round(fcst[,3:6], digits = 2)
+  colnames(fcst) <- c('fx','ds', 'fcst_arima', 'fcst_nnetwork','fcst_garch_cs', 'fcst_garch_ap')
+    dbWriteTable(con, "fcst_fx", fcst, append = TRUE, row.names = FALSE)
+  rm(fcst)
+      })
+  if(inherits(tryit, "try-error")){
+    i <- i+1
+  } 
+    setTxtProgressBar(pb, i)
+}
+```
+
+---ind---
+---log return---
+```{r} 
+ind_obj <- list()
+ind <- c("^N225","^HSI", "^GSPC", "^DJI", "^IXIC", "^TNX", "^FTSE")
+
+n <- length(ind)
+pb <- txtProgressBar(min = 0, max = n, style=3)
+
+for (i in 1:length(ind)){
+    tryit <- try(
+      {
+       ind_obj <- getSymbols(ind[i], from = from_date, to = Sys.Date(),auto.assign = FALSE)
+       return <- na.omit(Return.calculate(ind_obj[,4], method = "log"))
+  
+  # Automatic ARIMA forecasts
+  model_arima <- return %>%
+  auto.arima() %>%
+  forecast::forecast(h = forecast_horizon) 
+
+  # Neural Network
+  model_nnetwork <- return %>%
+  nnetar() %>%
+  forecast::forecast(h = forecast_horizon)
+  
+  df <- data.frame(ds = index(return), coredata(return))
+  future <- setNames(data.frame(seq(max(df$ds)+1, by = "day", length.out = forecast_horizon + holidays1 )), "ds")
+  future <- future[which(!future$ds %in% HK_future_holiday),]
+  
+  # Garch
+  spec <- ugarchspec(variance.model = list(model = "csGARCH"), mean.model = list(arfima=TRUE), distribution.model = "norm") 
+  spec1 <- ugarchspec(variance.model = list(model = "apARCH"), mean.model = list(arfima=TRUE), distribution.model = "norm")  
+  # Fit model
+  # Parameter Estimation 
+  fit <- ugarchfit(spec, return, solver = "hybrid"
+                 #, out.sample = test
+                 )
+  fit1 <- ugarchfit(spec1, return, solver = "hybrid"
+                 #, out.sample = test
+                 )
+  # Forecast
+  model_garch <- ugarchforecast(fit, n.ahead = forecast_horizon)
+  model_garch_1 <- ugarchforecast(fit1, n.ahead = forecast_horizon)
+  
+  fcst_garch <- last(ind_obj[,4])*exp(model_garch@forecast[["seriesFor"]])[1]
+  fcst_garch_1 <- last(ind_obj[,4])*exp(model_garch_1@forecast[["seriesFor"]])[1]
+  fcst_arima <- last(ind_obj[,4])*exp(model_arima$mean)[1]
+  fcst_nnetwork <- last(ind_obj[,4])*exp(model_nnetwork$mean)[1]
+for (j in 2: forecast_horizon){
+  fcst_garch <- rbind(fcst_garch,
+                      fcst_garch[j-1]*exp(model_garch@forecast[["seriesFor"]])[j])
+  fcst_garch_1 <- rbind(fcst_garch_1,
+                      fcst_garch_1[j-1]*exp(model_garch_1@forecast[["seriesFor"]])[j])
+  fcst_arima <- rbind(fcst_arima,
+                      fcst_arima[j-1]*exp(model_arima$mean)[j])
+  fcst_nnetwork <- rbind(fcst_nnetwork,
+                      fcst_nnetwork[j-1]*exp(model_arima$mean[j]))
+  }
+
+  fcst <- data.frame(ind[i], future, fcst_arima, fcst_nnetwork, fcst_garch, fcst_garch_1)
+  fcst[,3:6] <- round(fcst[,3:6], digits = 2)
+  colnames(fcst) <- c('ind','ds', 'fcst_arima', 'fcst_nnetwork','fcst_garch_cs', 'fcst_garch_ap')
+    dbWriteTable(con, "fcst_ind", fcst, append = TRUE, row.names = FALSE)
+  rm(fcst)
+      })
+  if(inherits(tryit, "try-error")){
+    i <- i+1
+  } 
+    setTxtProgressBar(pb, i)
+}
+```
+
+
+

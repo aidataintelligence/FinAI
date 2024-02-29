@@ -1,0 +1,120 @@
+---
+title: "Forecast_single"
+output: html_document
+date: "2023-04-04"
+---
+
+```{r}
+library(TTR)
+library(quantmod) 
+library(tidyquant)
+library(forecast)
+library(ggplot2)
+library(fracdiff)
+library(PerformanceAnalytics)
+library(rugarch)
+library(parallel)
+library(RQuantLib) 
+library(readr)
+library(RPostgreSQL)
+library(priceR)
+stock_df <- read_csv("Allstocks1.csv")
+```
+
+```{r}
+con <- DBI::dbConnect(RPostgres::Postgres()
+                      , host='localhost'
+                      , port='5432'
+                      , dbname= 'fcst'
+                      , user='postgres'
+                      , password="Chui1234!")
+```
+
+```{r}
+dbRemoveTable(con, "fcst")
+```
+
+```{r}
+from_date <- "2023-01-01"
+forecast_horizon <- 20
+HK_future_holiday  <- holidayList(calendar="HongKong", from = Sys.Date() , to = as.Date("2024-12-31"),
+                          includeWeekends = TRUE)
+holidays <- sum(HK_future_holiday < (Sys.Date() + forecast_horizon ))
+holidays1 <- sum(HK_future_holiday < (Sys.Date() + forecast_horizon + holidays ))
+```
+
+
+---stock---
+---log return for garch, diff for arima & nnetwork--
+```{r}
+n <- length(stock_df$symbol)
+pb <- txtProgressBar(min = 0, max = n, style=3)
+
+for (i in 1:length(stock_df$symbol)){
+    tryit <- try(
+      {
+      stock <- getSymbols(stock_df$symbol[[i]], from = from_date , to = Sys.Date(), auto.assign = FALSE)
+      #stock <- na.omit(stock)
+  colnames(stock) <- c("open","high","low","close","volume","adjusted")
+  return <- na.omit(Return.calculate(stock$close, method = "log"))
+  Stock <- na.omit(diff(stock[,4],1))
+  colnames(Stock) <- "y"
+  
+  # Automatic ARIMA forecasts
+  model_arima <- Stock %>%
+  auto.arima() %>%
+  forecast::forecast(h = forecast_horizon) 
+
+  # Neural Network
+  model_nnetwork <- stock[,4] %>%
+  nnetar() %>%
+  forecast::forecast(h = forecast_horizon)
+  
+  df <- data.frame(ds = index(Stock), coredata(Stock))
+
+  future <- setNames(data.frame(seq(max(df$ds)+1, by = "day", length.out = forecast_horizon + holidays1 )), "ds")
+  
+  future <- future[which(!future$ds %in% HK_future_holiday),]
+  
+  # Garch
+  spec <- ugarchspec(variance.model = list(model = "csGARCH"), mean.model = list(arfima=TRUE), distribution.model = "norm") 
+  spec1 <- ugarchspec(variance.model = list(model = "apARCH"), mean.model = list(arfima=TRUE), distribution.model = "norm")  
+  # Fit model
+  # Parameter Estimation 
+  fit <- ugarchfit(spec, return, solver = "hybrid"
+                 #, out.sample = test
+                 )
+  fit1 <- ugarchfit(spec1, return, solver = "hybrid"
+                 #, out.sample = test
+                 )
+  # Forecast
+  model_garch <- ugarchforecast(fit, n.ahead = forecast_horizon)
+  model_garch_1 <- ugarchforecast(fit1, n.ahead = forecast_horizon)
+
+  fcst_garch <- last(stock[,4])*exp(model_garch@forecast[["seriesFor"]])[1]
+  fcst_garch_1 <- last(stock[,4])*exp(model_garch_1@forecast[["seriesFor"]])[1]
+for (j in 2: forecast_horizon){
+  fcst_garch <- rbind(fcst_garch,
+                      fcst_garch[j-1]*exp(model_garch@forecast[["seriesFor"]])[j])
+  fcst_garch_1 <- rbind(fcst_garch_1,
+                      fcst_garch_1[j-1]*exp(model_garch_1@forecast[["seriesFor"]])[j])
+  }
+
+  
+  fcst_garch <- round(fcst_garch, digits = 2)
+  fcst_garch_1 <- round(fcst_garch_1, digits = 2)
+  fcst_arima <- round(diffinv(model_arima$mean, lag = 1, differences = 1, xi = stock[nrow(stock),4] )[-1], digits = 2)
+  fcst_nnetwork <- round(model_nnetwork$mean, digits = 2)
+  
+  fcst <- data.frame(stock_df$symbol[[i]], future, fcst_arima, fcst_nnetwork, fcst_garch, fcst_garch_1)
+  colnames(fcst)[c(1:2,5:6)] <- c('symbol','ds', 'fcst_garch_cs', 'fcst_garch_ap')
+    dbWriteTable(con, "fcst", fcst, append = TRUE, row.names = FALSE)
+  rm(fcst)
+      })
+  if(inherits(tryit, "try-error")){
+    i <- i+1
+  } 
+    setTxtProgressBar(pb, i)
+}
+```
+
